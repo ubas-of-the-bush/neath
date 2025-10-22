@@ -54,7 +54,7 @@ async fn refresh_bridge(Path(url): Path<String>) -> Result<String, MyErr> {
         .collect::<Vec<&str>>()
         .join(",");
 
-    let adapter = std::fs::read_dir("adapters")
+    let adapter = std::fs::read_dir("./adapters")
         .expect("could not open adapters directory")
         .find(|x| {
             if let Ok(f) = x {
@@ -66,20 +66,24 @@ async fn refresh_bridge(Path(url): Path<String>) -> Result<String, MyErr> {
         .ok_or(MyErr::NoAdapter)?
         .unwrap();
 
-    let adapted = std::process::Command::new(adapter.path())
+    let adapted = std::process::Command::new("python3")
+        .arg(adapter.path())
         .arg(decoded.as_str())
         .stdout(std::process::Stdio::piped())
         .spawn()
-        .map_err(|_| {
+        .map_err(|e| {
+            dbg!(e);
             MyErr::AdapterSpawnError
         })?
         .wait_with_output()
-        .map_err(|_| {
+        .map_err(|e| {
+            dbg!(e);
             MyErr::AdapterExecError
         })?;
 
     let output = str::from_utf8(&adapted.stdout)
-        .map_err(|_| {
+        .map_err(|e| {
+            dbg!(e);
             MyErr::AdapterError(500_u16, String::from("Adapter returned malformed UTF-8"))
         })?
         .to_owned();
@@ -107,4 +111,3 @@ async fn main() {
 
     axum::serve(listener, app).await.unwrap();
 }
-

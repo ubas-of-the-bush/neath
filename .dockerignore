@@ -1,0 +1,6 @@
+.venv
+*.lock
+cache/
+__pycache__
+pyproject.toml
+userscripts/lib

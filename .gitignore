@@ -2,3 +2,5 @@
 .venv
 *.lock
 cache/
+userscripts/*
+__pycache__
