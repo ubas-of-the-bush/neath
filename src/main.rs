@@ -1,11 +1,13 @@
 use axum::{Router, extract::Path, http::StatusCode, response::IntoResponse, routing::get};
 use tokio::net::TcpListener;
 
+#[derive(Debug)]
 enum MyErr {
     NoAdapter,                 // 404
     UrlDecodeError,            // 422
     AdapterSpawnError,         // 500
     AdapterExecError,          // 500
+    EnvDecodeError,            // 500
     AdapterError(u16, String), // other
 }
 
@@ -27,6 +29,10 @@ impl IntoResponse for MyErr {
             MyErr::AdapterExecError => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 String::from("Could not execute adapter\n"),
+            ),
+            MyErr::EnvDecodeError => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                String::from("Could not read .env file\n")
             ),
             MyErr::AdapterError(c, m) => (
                 StatusCode::from_u16(c).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -65,8 +71,49 @@ async fn refresh_bridge(Path(url): Path<String>) -> Result<String, MyErr> {
         })
         .ok_or(MyErr::NoAdapter)?
         .unwrap();
+    
+    let env_vars = std::fs::read_dir("./env")
+        .expect("could not open env vars directory")
+        .find(|x| {
+            if let Ok(f) = x {
+                f.file_name().to_str().unwrap().split(".").next() == Some(&rev_url)
+            } else {
+                false
+            }
+        })
+        .and_then(|x| {
+            let buf = std::fs::read_to_string(x.unwrap().path()).map_err(|_| MyErr::EnvDecodeError).unwrap();
 
-    let adapted = std::process::Command::new("python3")
+            let mut vars = std::collections::HashMap::new();
+
+            for dec in buf.split("\n") {
+                let (name, value) = dec.split_once('=').ok_or(MyErr::EnvDecodeError).unwrap();
+                vars.insert(name.to_owned(), value.to_owned());
+            };
+
+            Some(Ok(vars))
+        })
+        .transpose()?;
+
+    let adapted;
+    if let Some(env) = env_vars{
+        adapted = std::process::Command::new("python3")
+        .arg(adapter.path())
+        .arg(decoded.as_str())
+        .stdout(std::process::Stdio::piped())
+        .envs(&env)
+        .spawn()
+        .map_err(|e| {
+            dbg!(e);
+            MyErr::AdapterSpawnError
+        })?
+        .wait_with_output()
+        .map_err(|e| {
+            dbg!(e);
+            MyErr::AdapterExecError
+        })?;  
+    } else {
+        adapted = std::process::Command::new("python3")
         .arg(adapter.path())
         .arg(decoded.as_str())
         .stdout(std::process::Stdio::piped())
@@ -79,7 +126,8 @@ async fn refresh_bridge(Path(url): Path<String>) -> Result<String, MyErr> {
         .map_err(|e| {
             dbg!(e);
             MyErr::AdapterExecError
-        })?;
+        })?;   
+    }
 
     let output = str::from_utf8(&adapted.stdout)
         .map_err(|e| {

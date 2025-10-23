@@ -1,0 +1,216 @@
+#!./adapters/.venv/bin/python3
+
+"""
+Adapter meant to work with Spotify artist pages in the format:
+ https://open.spotify.com/artist/${ARTIST_ID}
+"""
+
+from lib.rss import RSSBuilder, Item as RSSItem
+from lib.baseadapter import BaseAdapter, InvalidStatusCodeError
+
+import requests
+import json
+
+from os import listdir, stat, getenv
+from time import time
+from typing import List, Optional, Literal, Dict
+from pathlib import Path
+from sys import argv
+from time import sleep
+from textwrap import dedent
+
+from pydantic import BaseModel, ValidationError
+
+class Image(BaseModel):
+    url: str
+    height: Optional[int] = None
+    width: Optional[int] = None
+
+class ExternalUrls(BaseModel):
+    spotify: str
+
+class SimplifiedArtist(BaseModel):
+    name: str
+    id: Optional[str] = None
+
+class Artist(BaseModel):
+    name: str
+    id: Optional[str] = None
+    images: List[Image]
+    external_urls: ExternalUrls
+
+class Album(BaseModel):
+    album_type: Literal["album", "single", "compilation"]
+    external_urls: ExternalUrls
+    href: str
+    images: List[Image]
+    name: str
+    release_date: str
+    artists: List[SimplifiedArtist]
+    album_group: Literal["album", "single", "compilation", "appears_on"]
+    # Including id as it's essential for identifying albums
+    id: str
+
+# Ignore pagination - Spotify returns the first 20 matches, if we don't specify limit/offset
+# And we don't need more than the first 20
+class AlbumsPage(BaseModel):
+    href: str
+    items: List[Album]
+
+class SimplifiedTrack(BaseModel):
+    name: str
+    track_number: int
+    external_urls: ExternalUrls
+
+# Ignore pagination - I'm not handling the case where an album has more than 50 tracks
+class TracksPage(BaseModel):
+    href: str
+    name: str
+    items: List[SimplifiedTrack]
+    release_date: str
+    external_urls: ExternalUrls
+    genres: List[str]
+
+
+class SpotifyAdapter(BaseAdapter):
+    def __init__(self):
+        try:
+            url = argv[1]
+        except IndexError:
+            print("No URL provided")
+            exit(500)
+        
+        super().__init__(url, timeout=10, redirects=True)
+
+        self.artist_id = self.url.split('/')[-1]
+        self.client_id = getenv("CLIENT_ID")
+        self.client_secret = getenv("CLIENT_SECRET")
+
+        if self.client_id is None or self.client_secret is None:
+            print("Client ID or client secret env vars not set")
+            exit(500)
+        
+        Path("./cache/com,spotify").mkdir(exist_ok=True)
+    
+    def get_token(self):
+        # spotify tokens are valid for 1 hour
+        # read cached token or otherwise get and cache new token
+        if stat(f"./cache/{Path(argv[0]).stem}/token").st_mtime - int(time()) >= 3600:
+            try:
+                r = self.session.post("https://accounts.spotify.com/api/token", 
+                    headers={"Content-Type": "application/x-www-form-urlencoded"}, 
+                    data=f"grant_type=client_credentials&client_id={self.client_id}&client_secret={self.client_secret}").json()
+            except requests.exceptions.RetryError:
+                print("Fetching access token failed, too many retries")
+                exit(504)
+            except requests.exceptions.JSONDecodeError:
+                print("Fetching access token failed, invalid JSON received") # TODO: logging
+                exit(502)
+            
+            self.session.headers.update({"Authorization": f"Bearer {r['access_token']}"})
+
+            with open(f"./cache/com,spotify/token", 'w', encoding="utf-8") as t:
+                t.write(str(r))
+        else:
+            with open(f"./cache/com,spotify/token", 'r', encoding="utf-8") as t:
+                tfile = json.loads(t.read())
+                self.session.headers.update({"Authorization": f"Bearer: {tfile['access_token']}"})
+    
+    def get_artist_data(self):
+        self.get_token()
+
+        try:
+            r = self.session.get(f"https://api.spotify.com/v1/artists/{self.artist_id}")
+
+            if r.status_code != 200:
+                print(f"Error status code ({r.status_code}) from https://api.spotify.com/v1/artists/{self.artist_id}")
+                exit(r.status_code)
+            artist = Artist.model_validate_json(r.text)
+
+            self.artist_name = artist.name
+            self.artist_image = min(artist.images, key=lambda x: (x.height if x.height else 9999) + (x.width if x.width else 9999))
+            self.artist_url = artist.external_urls.spotify
+                
+
+        except requests.exceptions.RetryError:
+            print(f"Requests timed out for https://api.spotify.com/v1/artists/{self.artist_id}")
+            exit(504)
+        except ValidationError:
+            print(f"Failed to deserialise response for https://api.spotify.com/v1/artists/{self.artist_id}")
+            exit(502)
+    
+    def get_releases(self) -> "SpotifyAdapter":
+        self.get_artist_data() # this call refreshes the access token
+        
+        try:
+            self.albums = AlbumsPage.model_validate_json(
+                self.session.get(f"https://api.spotify.com/v1/artists/{self.artist_id}/albums").text)
+        except requests.exceptions.RetryError:
+            print(f"Fetching album data for artist with ID {self.artist_id} failed, too many retries")
+            exit(504)
+        except ValidationError:
+            print(f"Could not deserialise JSON for album data for artist with ID {self.artist_id}")
+            exit(502)
+        
+        try:
+            self.cached_releases = set(listdir(Path(f"./cache/com,spotify/{self.artist_id}")))
+        except FileNotFoundError:
+            self.cached_releases = set()
+            Path(f"./cache/com,spotify/{self.artist_id}").mkdir(parents=True)
+
+        # I can't disambiguate between singles released as part of an album rollout or true singles, 
+        # because they're different songs with different IDs in Spotify's backend
+        # I can't deduplicate on song titles because artists can obviously release songs with the same title
+        # Cache all uncached releases:
+        for release in self.albums.items:
+            if release.id not in self.cached_releases:
+                try:
+                    tracks = TracksPage.model_validate_json(
+                        self.session.get(f"{release.href}?limit=50").text
+                    )
+                except ValidationError:
+                    print(f"Could not deserialise response to API call for tracks of album at {release.href}")
+                    exit(504)
+                
+                tracks.items = sorted(tracks.items, key=lambda x: x.track_number)
+
+                with open(f"./cache/com,spotify/{self.artist_id}/{release.id}", 'w', encoding="utf-8") as tcache:
+                    tcache.write(tracks.model_dump_json())
+        
+        return self
+    
+    def to_rss(self) -> str:
+        builder = RSSBuilder(self.artist_name, self.artist_url, f"{self.artist_name}'s Spotify releases")
+        cache_dir = Path(f"./cache/com,spotify/{self.artist_id}")
+
+        for r in sorted(self.albums.items, key=lambda x: x.release_date, reverse=True):
+            with open(cache_dir / r.id, 'r', encoding="utf-8") as release:
+                release_data = TracksPage.model_validate_json(release.read())
+                tracklist = "\n".join(map(lambda x: f"<li><a href=\"{x.external_urls.spotify}\">{x.name}</a></li>", release_data.items))
+
+                body = dedent(f"""
+                    <h1>
+                        <a href=\"{self.artist_url}\">{self.artist_name}</a> - <a href=\"{release_data.external_urls.spotify}\">{release_data.name}</a>
+                    </h1>
+                    <p>Released: {release_data.release_date}</p>
+                    <p>Genres: {release_data.genres}</p>
+                    <br>
+                    <br>
+                    <h3>Tracklist:</h3>
+                    <ol>
+                        {tracklist}
+                    </ol>
+                """)
+
+                item = RSSItem(release_data.name, release_data.external_urls.spotify, )
+
+                builder.add_item(item)
+
+        return builder.build().to_xml_string()
+
+if __name__ == "__main__":
+    print(SpotifyAdapter().get_releases().to_rss())
+    
+
+
+        
