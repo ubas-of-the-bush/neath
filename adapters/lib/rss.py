@@ -60,7 +60,7 @@ class ImageElem:
             raise ValueError("image width must be at most 144")
         
         if self.height is not None and self.height > 400:
-            raise ValueError("image hight must be at most 400")
+            raise ValueError("image height must be at most 400")
 
 
     def to_element(self) -> etree._Element:
