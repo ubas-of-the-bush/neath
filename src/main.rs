@@ -1,4 +1,5 @@
 use axum::{Router, extract::Path, http::StatusCode, response::IntoResponse, routing::get};
+use log::{debug, error, info};
 use tokio::net::TcpListener;
 
 #[derive(Debug)]
@@ -32,7 +33,7 @@ impl IntoResponse for MyErr {
             ),
             MyErr::EnvDecodeError => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                String::from("Could not read .env file\n")
+                String::from("Could not read .env file\n"),
             ),
             MyErr::AdapterError(c, m) => (
                 StatusCode::from_u16(c).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -46,10 +47,18 @@ impl IntoResponse for MyErr {
 async fn refresh_bridge(Path(url): Path<String>) -> Result<String, MyErr> {
     let decoded = url::Url::parse(
         urlencoding::decode(&url)
-            .map_err(|_| MyErr::UrlDecodeError)?
+            .map_err(|_| {
+                error!("Incorrectly URL-encoded request: {url}");
+                MyErr::UrlDecodeError
+            })?
             .as_ref(),
     )
-    .map_err(|_| MyErr::UrlDecodeError)?;
+    .map_err(|_| {
+        error!("Request is not a URL: {url}");
+        MyErr::UrlDecodeError
+    })?;
+
+    info!("Received request to scrape: {decoded}");
 
     let rev_url = decoded
         .host()
@@ -60,6 +69,8 @@ async fn refresh_bridge(Path(url): Path<String>) -> Result<String, MyErr> {
         .collect::<Vec<&str>>()
         .join(",");
 
+    debug!("Looking for adapter called {rev_url}");
+
     let adapter = std::fs::read_dir("./adapters")
         .expect("could not open adapters directory")
         .find(|x| {
@@ -69,9 +80,28 @@ async fn refresh_bridge(Path(url): Path<String>) -> Result<String, MyErr> {
                 false
             }
         })
-        .ok_or(MyErr::NoAdapter)?
-        .unwrap();
+        .or_else(|| {
+            std::fs::read_dir("./userscripts")
+                .expect("could not open userscripts directory")
+                .find(|x| {
+                    if let Ok(f) = x {
+                        f.file_name().to_str().unwrap().split(".").next() == Some(&rev_url)
+                    } else {
+                        false
+                    }
+                })
+        })
+        .ok_or_else(|| {
+            error!("No adapters for {rev_url} found in either adapters or userscripts directories");
+            MyErr::NoAdapter
+        })?
+        .map_err(|e| {
+            error!("Error reading adapters directory: {e}");
+            MyErr::NoAdapter
+        })?;
     
+    debug!("Adapter found at {}", adapter.path().display());
+
     let env_vars = std::fs::read_dir("./env")
         .expect("could not open env vars directory")
         .find(|x| {
@@ -89,44 +119,48 @@ async fn refresh_bridge(Path(url): Path<String>) -> Result<String, MyErr> {
             for dec in buf.split("\n") {
                 let (name, value) = dec.split_once('=').ok_or(MyErr::EnvDecodeError)?;
                 vars.insert(name.to_owned(), value.to_owned());
-            };
+            }
 
             Ok(vars)
         })
-        .transpose()?;
+        .transpose()
+        .inspect_err(|_| {
+            error!("Could not parse .env file for adapter {rev_url}");
+        })?;
 
     let adapted;
-    if let Some(env) = env_vars{
+    debug!("Spawning adapter for {rev_url}");
+    if let Some(env) = env_vars {
         adapted = std::process::Command::new("python3")
-        .arg(adapter.path())
-        .arg(decoded.as_str())
-        .stdout(std::process::Stdio::piped())
-        .envs(&env)
-        .spawn()
-        .map_err(|e| {
-            dbg!(e);
-            MyErr::AdapterSpawnError
-        })?
-        .wait_with_output()
-        .map_err(|e| {
-            dbg!(e);
-            MyErr::AdapterExecError
-        })?;  
+            .arg(adapter.path())
+            .arg(decoded.as_str())
+            .stdout(std::process::Stdio::piped())
+            .envs(&env)
+            .spawn()
+            .map_err(|e| {
+                dbg!(e);
+                MyErr::AdapterSpawnError
+            })?
+            .wait_with_output()
+            .map_err(|e| {
+                dbg!(e);
+                MyErr::AdapterExecError
+            })?;
     } else {
         adapted = std::process::Command::new("python3")
-        .arg(adapter.path())
-        .arg(decoded.as_str())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            dbg!(e);
-            MyErr::AdapterSpawnError
-        })?
-        .wait_with_output()
-        .map_err(|e| {
-            dbg!(e);
-            MyErr::AdapterExecError
-        })?;   
+            .arg(adapter.path())
+            .arg(decoded.as_str())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                dbg!(e);
+                MyErr::AdapterSpawnError
+            })?
+            .wait_with_output()
+            .map_err(|e| {
+                dbg!(e);
+                MyErr::AdapterExecError
+            })?;
     }
 
     let output = str::from_utf8(&adapted.stdout)
@@ -151,6 +185,8 @@ async fn refresh_bridge(Path(url): Path<String>) -> Result<String, MyErr> {
 
 #[tokio::main]
 async fn main() {
+    env_logger::init();
+
     let app = Router::new().route("/v0/bridge/{url}", get(refresh_bridge));
 
     let listener = TcpListener::bind(std::env::args().nth(1).expect("Address not specified"))
