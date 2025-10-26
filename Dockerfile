@@ -33,6 +33,6 @@ VOLUME ["/home/librarian/neath/cache", "/home/librarian/neath/userscripts", "/ho
 
 EXPOSE 62244
 
-RUN python3 -m pip install bs4 lxml requests
+RUN python3 -m pip install bs4 lxml requests pydantic selenium
 	
 CMD ["/home/librarian/neath/neath", "0.0.0.0:62244"]
