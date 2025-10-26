@@ -135,6 +135,7 @@ async fn refresh_bridge(Path(url): Path<String>) -> Result<String, MyErr> {
             .arg(adapter.path())
             .arg(decoded.as_str())
             .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
             .envs(&env)
             .spawn()
             .map_err(|e| {
@@ -151,6 +152,7 @@ async fn refresh_bridge(Path(url): Path<String>) -> Result<String, MyErr> {
             .arg(adapter.path())
             .arg(decoded.as_str())
             .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
             .spawn()
             .map_err(|e| {
                 dbg!(e);
