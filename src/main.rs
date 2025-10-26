@@ -81,17 +81,17 @@ async fn refresh_bridge(Path(url): Path<String>) -> Result<String, MyErr> {
                 false
             }
         })
-        .and_then(|x| {
-            let buf = std::fs::read_to_string(x.unwrap().path()).map_err(|_| MyErr::EnvDecodeError).unwrap();
+        .map(|x| {
+            let buf = std::fs::read_to_string(x.unwrap().path()).or(Err(MyErr::EnvDecodeError))?;
 
             let mut vars = std::collections::HashMap::new();
 
             for dec in buf.split("\n") {
-                let (name, value) = dec.split_once('=').ok_or(MyErr::EnvDecodeError).unwrap();
+                let (name, value) = dec.split_once('=').ok_or(MyErr::EnvDecodeError)?;
                 vars.insert(name.to_owned(), value.to_owned());
             };
 
-            Some(Ok(vars))
+            Ok(vars)
         })
         .transpose()?;
 
