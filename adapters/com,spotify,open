@@ -95,7 +95,12 @@ class SpotifyAdapter(BaseAdapter):
     def get_token(self):
         # spotify tokens are valid for 1 hour
         # read cached token or otherwise get and cache new token
-        if stat(f"./cache/{Path(argv[0]).stem}/token").st_mtime - int(time()) >= 3600:
+        try:
+            token_stat = stat("./cache/com,spotify/token")
+        except FileNotFoundError:
+            token_stat = None
+
+        if token_stat is None or token_stat.st_mtime - int(time()) >= 3600:
             try:
                 r = self.session.post("https://accounts.spotify.com/api/token", 
                     headers={"Content-Type": "application/x-www-form-urlencoded"}, 
