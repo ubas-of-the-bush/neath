@@ -5,3 +5,4 @@ cache/
 userscripts/*
 __pycache__
 env/*
+.vscode

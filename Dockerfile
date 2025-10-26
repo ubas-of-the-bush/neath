@@ -23,11 +23,13 @@ COPY --from=build /build/target/release/neath /home/librarian/neath/neath
 
 COPY --chmod=755 ./adapters ./userscripts ./adapters
 
+COPY ./env ./env
+
 RUN chmod +x ./neath && chown -R librarian:librarian /home/librarian
 
 USER librarian
 
-VOLUME ["/home/librarian/neath/cache", "/home/librarian/neath/userscripts"]
+VOLUME ["/home/librarian/neath/cache", "/home/librarian/neath/userscripts", "/home/librarian/neath/env"]
 
 EXPOSE 62244
 

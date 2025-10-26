@@ -10,10 +10,11 @@ from lib.baseadapter import BaseAdapter, InvalidStatusCodeError
 
 import requests
 import json
+import logging
 
-from os import listdir, stat, getenv
+from os import listdir, stat, getenv, environ
 from time import time
-from typing import List, Optional, Literal, Dict
+from typing import List, Optional, Literal
 from pathlib import Path
 from sys import argv
 from time import sleep
@@ -65,11 +66,7 @@ class SimplifiedTrack(BaseModel):
 # Ignore pagination - I'm not handling the case where an album has more than 50 tracks
 class TracksPage(BaseModel):
     href: str
-    name: str
     items: List[SimplifiedTrack]
-    release_date: str
-    external_urls: ExternalUrls
-    genres: List[str]
 
 
 class SpotifyAdapter(BaseAdapter):
@@ -115,14 +112,15 @@ class SpotifyAdapter(BaseAdapter):
             self.session.headers.update({"Authorization": f"Bearer {r['access_token']}"})
 
             with open(f"./cache/com,spotify/token", 'w', encoding="utf-8") as t:
-                t.write(str(r))
+                t.write(json.dumps(r))
         else:
             with open(f"./cache/com,spotify/token", 'r', encoding="utf-8") as t:
                 tfile = json.loads(t.read())
-                self.session.headers.update({"Authorization": f"Bearer: {tfile['access_token']}"})
+                self.session.headers.update({"Authorization": f"Bearer {tfile['access_token']}"})
     
     def get_artist_data(self):
         self.get_token()
+        sleep(0.5)
 
         try:
             r = self.session.get(f"https://api.spotify.com/v1/artists/{self.artist_id}")
@@ -130,6 +128,7 @@ class SpotifyAdapter(BaseAdapter):
             if r.status_code != 200:
                 print(f"Error status code ({r.status_code}) from https://api.spotify.com/v1/artists/{self.artist_id}")
                 exit(r.status_code)
+            
             artist = Artist.model_validate_json(r.text)
 
             self.artist_name = artist.name
@@ -140,12 +139,14 @@ class SpotifyAdapter(BaseAdapter):
         except requests.exceptions.RetryError:
             print(f"Requests timed out for https://api.spotify.com/v1/artists/{self.artist_id}")
             exit(504)
-        except ValidationError:
+        except ValidationError as e:
+            logging.error(f"Deserialisation failed: {e}")
             print(f"Failed to deserialise response for https://api.spotify.com/v1/artists/{self.artist_id}")
             exit(502)
     
     def get_releases(self) -> "SpotifyAdapter":
         self.get_artist_data() # this call refreshes the access token
+        sleep(0.5)
         
         try:
             self.albums = AlbumsPage.model_validate_json(
@@ -153,7 +154,8 @@ class SpotifyAdapter(BaseAdapter):
         except requests.exceptions.RetryError:
             print(f"Fetching album data for artist with ID {self.artist_id} failed, too many retries")
             exit(504)
-        except ValidationError:
+        except ValidationError as e:
+            logging.error(f"Deserialisation failed: {e}")
             print(f"Could not deserialise JSON for album data for artist with ID {self.artist_id}")
             exit(502)
         
@@ -171,9 +173,10 @@ class SpotifyAdapter(BaseAdapter):
             if release.id not in self.cached_releases:
                 try:
                     tracks = TracksPage.model_validate_json(
-                        self.session.get(f"{release.href}?limit=50").text
+                        self.session.get(f"{release.href}/tracks?limit=50").text
                     )
-                except ValidationError:
+                except ValidationError as e:
+                    logging.error(f"Deserialisation failed: {e}")
                     print(f"Could not deserialise response to API call for tracks of album at {release.href}")
                     exit(504)
                 
@@ -195,10 +198,9 @@ class SpotifyAdapter(BaseAdapter):
 
                 body = dedent(f"""
                     <h1>
-                        <a href=\"{self.artist_url}\">{self.artist_name}</a> - <a href=\"{release_data.external_urls.spotify}\">{release_data.name}</a>
+                        <a href=\"{self.artist_url}\">{self.artist_name}</a> - <a href=\"{r.external_urls.spotify}\">{r.name}</a>
                     </h1>
-                    <p>Released: {release_data.release_date}</p>
-                    <p>Genres: {release_data.genres}</p>
+                    <p>Released: {r.release_date}</p>
                     <br>
                     <br>
                     <h3>Tracklist:</h3>
@@ -207,13 +209,14 @@ class SpotifyAdapter(BaseAdapter):
                     </ol>
                 """)
 
-                item = RSSItem(release_data.name, release_data.external_urls.spotify, )
+                item = RSSItem(r.name, r.external_urls.spotify, body, pub_date=r.release_date)
 
                 builder.add_item(item)
 
         return builder.build().to_xml_string()
 
 if __name__ == "__main__":
+    logging.basicConfig(level=environ.get("RUST_LOG", "INFO").upper())
     print(SpotifyAdapter().get_releases().to_rss())
     
 
