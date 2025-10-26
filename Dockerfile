@@ -1,3 +1,15 @@
+FROM rust:1.90-alpine3.20 AS build
+
+WORKDIR /build
+
+COPY Cargo.toml config.toml .
+
+COPY ./src/ ./src
+
+RUN apk add musl-dev
+
+RUN cargo build --release
+
 FROM python:alpine3.22
 
 RUN adduser -D -h /home/librarian -u 1000 -g 1000 librarian
@@ -7,7 +19,7 @@ RUN mkdir -p /home/librarian/neath/adapters \
 	
 WORKDIR /home/librarian/neath
 
-COPY ./target/x86_64-unknown-linux-musl/release/neath /home/librarian/neath/neath
+COPY --from=build /build/target/release/neath /home/librarian/neath/neath
 
 COPY --chmod=755 ./adapters ./userscripts ./adapters
 

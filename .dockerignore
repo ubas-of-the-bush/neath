@@ -1,6 +1,6 @@
 .venv
-*.lock
+adapters/uv.lock
 cache/
-__pycache__
-pyproject.toml
+*/__pycache__
+adapters/pyproject.toml
 userscripts/lib
