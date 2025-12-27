@@ -97,7 +97,7 @@ class SpotifyAdapter(BaseAdapter):
         except FileNotFoundError:
             token_stat = None
 
-        if token_stat is None or token_stat.st_mtime - int(time()) >= 3600:
+        if token_stat is None or int(time()) - token_stat.st_mtime >= 3600:
             try:
                 r = self.session.post("https://accounts.spotify.com/api/token", 
                     headers={"Content-Type": "application/x-www-form-urlencoded"}, 
@@ -184,6 +184,8 @@ class SpotifyAdapter(BaseAdapter):
 
                 with open(f"./cache/com,spotify/{self.artist_id}/{release.id}", 'w', encoding="utf-8") as tcache:
                     tcache.write(tracks.model_dump_json())
+
+                sleep(1)
         
         return self
     
@@ -201,7 +203,7 @@ class SpotifyAdapter(BaseAdapter):
                         <a href=\"{self.artist_url}\">{self.artist_name}</a> - <a href=\"{r.external_urls.spotify}\">{r.name}</a>
                     </h1>
                     <p>Released: {r.release_date}</p>
-                    <br>
+                    <p>Type: {r.album_type}</p>
                     <br>
                     <h3>Tracklist:</h3>
                     <ol>
