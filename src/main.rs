@@ -1,5 +1,6 @@
 use axum::{Router, extract::Path, http::StatusCode, response::IntoResponse, routing::get};
 use log::{debug, error, info};
+use std::collections::HashMap;
 use tokio::net::TcpListener;
 
 #[derive(Debug)]
@@ -99,10 +100,24 @@ async fn refresh_bridge(Path(url): Path<String>) -> Result<String, MyErr> {
             error!("Error reading adapters directory: {e}");
             MyErr::NoAdapter
         })?;
-    
+
     debug!("Adapter found at {}", adapter.path().display());
 
-    let env_vars = std::fs::read_dir("./env")
+    let mut env;
+
+    // python logging module doesn't support TRACE level
+    // and if a log level isn't set, it defaults to INFO
+    if let Ok(log_level) = std::env::var("RUST_LOG") {
+        if log_level != "TRACE" {
+            env = HashMap::from([(String::from("RUST_LOG"), log_level)]);
+        } else {
+            env = HashMap::from([(String::from("RUST_LOG"), String::from("DEBUG"))]);
+        }
+    } else {
+        env = HashMap::from([(String::from("RUST_LOG"), String::from("INFO"))]);
+    };
+
+    if let Some(f) = std::fs::read_dir("./env")
         .expect("could not open env vars directory")
         .find(|x| {
             if let Ok(f) = x {
@@ -111,59 +126,37 @@ async fn refresh_bridge(Path(url): Path<String>) -> Result<String, MyErr> {
                 false
             }
         })
-        .map(|x| {
-            let buf = std::fs::read_to_string(x.unwrap().path()).or(Err(MyErr::EnvDecodeError))?;
+    {
+        debug!(
+            "reading .env file for adapter {}",
+            f.as_ref().unwrap().path().display()
+        );
+        let buf = std::fs::read_to_string(f.unwrap().path()).or(Err(MyErr::EnvDecodeError))?;
 
-            let mut vars = std::collections::HashMap::new();
-
-            for dec in buf.split("\n") {
-                let (name, value) = dec.split_once('=').ok_or(MyErr::EnvDecodeError)?;
-                vars.insert(name.to_owned(), value.to_owned());
-            }
-
-            Ok(vars)
-        })
-        .transpose()
-        .inspect_err(|_| {
-            error!("Could not parse .env file for adapter {rev_url}");
-        })?;
-
-    let adapted;
-    debug!("Spawning adapter for {rev_url}");
-    if let Some(env) = env_vars {
-        adapted = std::process::Command::new("python3")
-            .arg(adapter.path())
-            .arg(decoded.as_str())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .envs(&env)
-            .spawn()
-            .map_err(|e| {
-                dbg!(e);
-                MyErr::AdapterSpawnError
-            })?
-            .wait_with_output()
-            .map_err(|e| {
-                dbg!(e);
-                MyErr::AdapterExecError
-            })?;
-    } else {
-        adapted = std::process::Command::new("python3")
-            .arg(adapter.path())
-            .arg(decoded.as_str())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .map_err(|e| {
-                dbg!(e);
-                MyErr::AdapterSpawnError
-            })?
-            .wait_with_output()
-            .map_err(|e| {
-                dbg!(e);
-                MyErr::AdapterExecError
-            })?;
+        for dec in buf.split("\n") {
+            let (name, value) = dec.split_once('=').ok_or(MyErr::EnvDecodeError)?;
+            env.insert(name.to_owned(), value.to_owned());
+        }
     }
+
+    debug!("Spawning adapter for {rev_url}");
+
+    let adapted = std::process::Command::new("python3")
+        .arg(adapter.path())
+        .arg(decoded.as_str())
+        .envs(&env)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(|e| {
+            dbg!(e);
+            MyErr::AdapterSpawnError
+        })?
+        .wait_with_output()
+        .map_err(|e| {
+            dbg!(e);
+            MyErr::AdapterExecError
+        })?;
 
     let output = str::from_utf8(&adapted.stdout)
         .map_err(|e| {
