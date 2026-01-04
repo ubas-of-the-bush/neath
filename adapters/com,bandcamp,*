@@ -1,0 +1,172 @@
+#!./adapters/.venv/bin/python3
+
+"""
+Adapter for Bandcamp artist pages (discography) in the format:
+https://${ARTIST_NAME}.bandcamp.com/music
+
+- get_albums(): scrapes the artist page for album links, downloads uncached album pages,
+  extracts album metadata and tracklist and writes cache files.
+- get_tracks(): extracts individual track entries from album pages (writes per-track cache).
+- to_rss(): builds a simple RSS feed from cached albums.
+"""
+
+from lib.rss import RSSBuilder, Item as RSSItem
+from lib.baseadapter import BaseAdapter, InvalidStatusCodeError
+
+from bs4 import BeautifulSoup
+
+from pathlib import Path
+from os import listdir, environ
+from sys import argv
+from time import sleep
+from urllib.parse import urljoin, urlparse
+from textwrap import dedent
+import logging
+
+class BandcampAdapter(BaseAdapter):
+    def __init__(self) -> None:
+        try:
+            self.url = argv[1]
+        except IndexError:
+            print("No URL provided")
+            exit(500)
+
+        super().__init__(self.url, timeout=10, redirects=True, http=True, browser=False)
+
+        # artist key for cache dir: use hostname + last path segment if present
+        parsed = urlparse(self.url)
+        self.artist_key = parsed.hostname.split(".")[0] if parsed.hostname else "bandcamp"
+        Path(f"./cache/com,bandcamp/{self.artist_key}").mkdir(parents=True, exist_ok=True)
+
+    def get_discog(self) -> "BandcampAdapter":
+        try:
+            self.soup = self.scrape_site(self.url)
+        except InvalidStatusCodeError as e:
+            print(e.body)
+            exit(e.status_code)
+
+        music_grid = self.soup.select_one("ol#music-grid")
+        if music_grid is None:
+            print("No <ol id='music-grid'> found")
+            exit(500)
+
+        self.links = music_grid.select("li a[href]")
+        if not self.links:
+            print("No album links found in music grid")
+            exit(500)
+
+        try:
+            self.cached_releases = set(listdir(Path(f"./cache/com,bandcamp/{self.artist_key}")))
+        except FileNotFoundError:
+            self.cached_releases = set()
+            Path(f"./cache/com,bandcamp/{self.artist_key}").mkdir(parents=True)
+
+        for l in self.links:
+            href = str(l.get("href"))
+            if href is None:
+                continue
+            album_url = urljoin(self.url, href)
+            slug = href.rstrip('/').split('/')[-1]
+
+            if slug in self.cached_releases:
+                continue
+
+            sleep(1)
+            
+            try:
+                album_soup = self.scrape_site(album_url)
+            except InvalidStatusCodeError as e:
+                print(f"Fetching {album_url} failed: {e.status_code}")
+                exit(e.status_code)
+
+            # album title
+            title = None
+            # try common selectors
+            if (t := album_soup.select_one("meta[property='og:title']")) is not None:
+                title = t.get("content")
+            if not title and (t := album_soup.select_one("h2.trackTitle")) is not None:
+                title = t.get_text().strip()
+            if not title:
+                title = album_soup.title.string.strip() if album_soup.title else slug
+
+            # artist name
+            artist = None
+            if (a := album_soup.select_one("a[itemprop='byArtist']")) is not None:
+                artist = a.get_text().strip()
+            if not artist and (a := album_soup.select_one("div#name-section h3")) is not None:
+                artist = a.get_text().strip().lstrip("by").strip()
+            if not artist:
+                artist = self.url.split(".")[0]
+
+            # release date (optional)
+            release_date = None
+            if (d := album_soup.select_one("meta[itemprop='datePublished']")) is not None:
+                release_date = d.get("content")
+
+            about = album_soup.select_one("div[class*='tralbum-about']").get_text(" ")
+            copyright = album_soup.select_one("div[class*='tralbum-credits']")
+            tags = ", ".join([t.get_text() for t in album_soup.select("div[class*='tralbum-tags'] a")])
+
+            # tracklist
+            tracks = []
+            table = album_soup.select_one("table#track_table")
+            if table is not None:
+                for tr in table.select("tr.track_row_view"):
+                    title_el = tr.select_one("span.track-title")
+                    href_el = tr.select_one("a[href]")
+                    time_el = tr.select_one("span.time")
+                    track_title = title_el.get_text().strip() if title_el else None
+                    track_href = urljoin(self.url, href_el.get("href")) if href_el else None
+                    duration = time_el.get_text().strip() if time_el else None
+                    if track_title:
+                        tracks.append({"title": track_title, "href": track_href, "duration": duration})
+            else:
+                # some album pages use ul.trackList or other structure; try a fallback
+                for li in album_soup.select("ol.trackList li"):
+                    tt = li.select_one("span.track-title")
+                    tlink = li.select_one("a[href]")
+                    tdur = li.select_one("span.time")
+                    if tt:
+                        tracks.append({
+                            "title": tt.get_text().strip(),
+                            "href": urljoin(self.url, tlink.get("href")) if tlink else None,
+                            "duration": tdur.get_text().strip() if tdur else None
+                        })
+
+            if not tracks:
+                logging.info(f"No tracks found for {album_url}")
+
+            # write cache file
+            with open(f"cache/com,bandcamp/{self.artist_key}/{slug}", "w", encoding="utf-8") as cached:
+                header = f"<h1><a href=\"{album_url}\">{title}</a></h1>\n<p>Artist: {artist}</p>\n"
+                if release_date:
+                    header += f"<p>Released: {release_date}</p>\n"
+                header += "<h3>Tracklist:</h3>\n<ol>\n"
+                for t in tracks:
+                    href_attr = f' href="{t["href"]}"' if t.get("href") else ""
+                    dur = f' <span class="time">{t["duration"]}</span>' if t.get("duration") else ""
+                    header += f'  <li><a{href_attr}>{t["title"]}</a>{dur}</li>\n'
+                header += "</ol>\n"
+                header += f"<p>{about}</p><br>"
+                header += f"<p>{copyright}</p><br>"
+                header += f"<h3>Tags</h3>\n{tags}"
+
+                cached.write(dedent(header))
+
+        return self
+
+    def to_rss(self) -> str:
+        cache_dir = Path(f"./cache/com,bandcamp/{self.artist_key}")
+        builder = RSSBuilder(self.artist_key, self.url, f"{self.artist_key}'s Bandcamp releases")
+        
+        for album in self.links:
+            with open(cache_dir / album.get("href").rstrip('/').split('/')[-1], 'r', encoding="utf-8") as f:
+                cached_album = f.read()
+                builder.add_item(RSSItem(title=album.get_text(), link=album.get("href"), description=cached_album))
+
+        return builder.build().to_xml_string(pretty=True, xml_declaration=True)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=environ.get("RUST_LOG", "DEBUG"))
+    print(BandcampAdapter().get_discog().to_rss())
